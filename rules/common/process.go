@@ -33,6 +33,10 @@ func (ps *Process) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, 
 	if helper.FindProcess != nil {
 		helper.FindProcess()
 	}
+	if ps.ruleType == C.ProcessName && strings.HasPrefix(ps.pattern, "/") {
+		return matchProcessPathByNameRule(ps.pattern, metadata.ProcessPath), ps.adapter
+	}
+
 	var target string
 	switch ps.ruleType {
 	case C.ProcessName, C.ProcessNameRegex, C.ProcessNameWildcard:
@@ -69,6 +73,14 @@ func NewProcess(pattern string, adapter string, ruleType C.RuleType) (*Process, 
 	default:
 	}
 	return ps, nil
+}
+
+func matchProcessPathByNameRule(pattern, path string) bool {
+	if strings.HasSuffix(pattern, "/") {
+		return len(path) >= len(pattern) && strings.EqualFold(path[:len(pattern)], pattern)
+	}
+
+	return strings.EqualFold(path, pattern)
 }
 
 var _ C.Rule = (*Process)(nil)

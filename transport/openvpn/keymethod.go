@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"strings"
 )
 
 const (
@@ -21,7 +22,14 @@ const (
 	maxHMACKeyLength   = 64
 	keyBlockSize       = 2 * (maxCipherKeyLength + maxHMACKeyLength)
 
-	keyExpansionID = "OpenVPN"
+	keyExpansionID          = "OpenVPN"
+	exportKeyDataLabel      = "EXPORTER-OpenVPN-datakeys"
+	exportedKeyMaterialSize = keyBlockSize
+
+	ivProtoDataV2        = 1 << 1
+	ivProtoTLSKeyExport  = 1 << 3
+	ivProtoAuthPendingKW = 1 << 4
+	ivProtoAuthFailTemp  = 1 << 8
 )
 
 type KeySource struct {
@@ -86,14 +94,19 @@ func (r *KeyMethod2Record) MarshalClient() ([]byte, error) {
 }
 
 func ParseServerKeyMethod2Record(packet []byte) (*KeyMethod2Record, error) {
+	record, _, err := parseServerKeyMethod2Record(packet)
+	return record, err
+}
+
+func parseServerKeyMethod2Record(packet []byte) (*KeyMethod2Record, int, error) {
 	if len(packet) < 4+1+keySourceRandomSize*2 {
-		return nil, errors.New("key method 2 packet too short")
+		return nil, 0, errors.New("key method 2 packet too short")
 	}
 	if binary.BigEndian.Uint32(packet[:4]) != 0 {
-		return nil, errors.New("invalid key method 2 prefix")
+		return nil, 0, errors.New("invalid key method 2 prefix")
 	}
 	if packet[4]&0x0f != KeyMethod2 {
-		return nil, fmt.Errorf("unsupported key method %d", packet[4])
+		return nil, 0, fmt.Errorf("unsupported key method %d", packet[4])
 	}
 	offset := 5
 	record := &KeyMethod2Record{}
@@ -105,12 +118,12 @@ func ParseServerKeyMethod2Record(packet []byte) (*KeyMethod2Record, error) {
 	var err error
 	record.Options, offset, err = readOpenVPNString(packet, offset)
 	if err != nil {
-		return nil, fmt.Errorf("read options: %w", err)
+		return nil, 0, fmt.Errorf("read options: %w", err)
 	}
 	record.Username, offset, _ = readOpenVPNString(packet, offset)
 	record.Password, offset, _ = readOpenVPNString(packet, offset)
-	record.PeerInfo, _, _ = readOpenVPNString(packet, offset)
-	return record, nil
+	record.PeerInfo, offset, _ = readOpenVPNString(packet, offset)
+	return record, offset, nil
 }
 
 func DeriveClientKeyMaterial(sources KeySource2, clientSession, serverSession SessionID, cipherKeyLen int) (*KeyMaterial, error) {
@@ -153,30 +166,77 @@ func DeriveClientKeyMaterial(sources KeySource2, clientSession, serverSession Se
 	}, nil
 }
 
-func InstallScriptOptionsString(proto, cipher, auth string, compLZO string) string {
+func DeriveClientKeyMaterialExported(exported []byte, cipherKeyLen int) (*KeyMaterial, error) {
+	if cipherKeyLen != 16 && cipherKeyLen != 24 && cipherKeyLen != 32 {
+		return nil, fmt.Errorf("unsupported data cipher key length %d", cipherKeyLen)
+	}
+	if len(exported) != exportedKeyMaterialSize {
+		return nil, fmt.Errorf("unexpected exported key material length %d, expected %d", len(exported), exportedKeyMaterialSize)
+	}
+	clientToServer := exported[:maxCipherKeyLength+maxHMACKeyLength]
+	serverToClient := exported[maxCipherKeyLength+maxHMACKeyLength:]
+	return &KeyMaterial{
+		SendCipherKey: cloneBytes(clientToServer[:cipherKeyLen]),
+		SendHMACKey:   cloneBytes(clientToServer[maxCipherKeyLength : maxCipherKeyLength+maxHMACKeyLength]),
+		RecvCipherKey: cloneBytes(serverToClient[:cipherKeyLen]),
+		RecvHMACKey:   cloneBytes(serverToClient[maxCipherKeyLength : maxCipherKeyLength+maxHMACKeyLength]),
+	}, nil
+}
+
+func InstallScriptOptionsString(proto, cipher, auth, keyDirection, controlKeyMode, compression string) string {
 	protoName := "UDPv4"
 	if proto == ProtoTCP {
 		protoName = "TCPv4_CLIENT"
 	}
 	keysize := "128"
-	if cipher == CipherAES256GCM || cipher == CipherAES256CBC || cipher == CipherChaCha20Poly1305 {
+	if cipher == CipherAES192GCM || cipher == CipherAES192CBC {
+		keysize = "192"
+	} else if cipher == CipherAES256GCM || cipher == CipherAES256CBC || cipher == CipherChaCha20Poly1305 {
 		keysize = "256"
 	}
-	mtu := "1550"
-	comp := ""
-	if compLZO == CompLzoYes {
-		mtu = "1544"
-		comp = "comp-lzo,"
+	linkMTU := 1550
+	compression = normalizeCompressionUnchecked(compression)
+	switch compression {
+	case CompressionCompLZO:
+		linkMTU = 1544
+	case CompressionStub, CompressionCompLZONo:
+		linkMTU++
 	}
-	return fmt.Sprintf("V4,dev-type tun,link-mtu %s,tun-mtu 1500,proto %s,%scipher %s,auth %s,keysize %s,key-method 2,tls-client", mtu, protoName, comp, cipher, auth, keysize)
+	options := fmt.Sprintf("V4,dev-type tun,link-mtu %d,tun-mtu 1500,proto %s", linkMTU, protoName)
+	if compression != CompressionNone {
+		options += ",comp-lzo"
+	}
+	keyDirection = strings.TrimSpace(keyDirection)
+	if keyDirection == "0" || keyDirection == "1" {
+		options += ",keydir " + keyDirection
+	}
+	if controlKeyMode == "tls-auth" {
+		options += ",tls-auth"
+	}
+	return fmt.Sprintf("%s,cipher %s,auth %s,keysize %s,key-method 2,tls-client", options, cipher, auth, keysize)
 }
 
-func InstallScriptPeerInfo(cipher string, compLZO string) string {
-	lzo := ""
-	if compLZO == CompLzoYes {
-		lzo = "IV_LZO=1\n"
+func InstallScriptPeerInfo(proto, cipher, compression string) string {
+	ivProto := ivProtoDataV2 | ivProtoTLSKeyExport | ivProtoAuthPendingKW | ivProtoAuthFailTemp
+	peerInfo := fmt.Sprintf("IV_VER=2.6.14\nIV_PLAT=mac\nIV_NCP=2\nIV_CIPHERS=%s\nIV_MTU=1500\nIV_PROTO=%d\n", cipher, ivProto)
+	if proto == ProtoTCP {
+		peerInfo += "IV_TCPNL=1\n"
 	}
-	return fmt.Sprintf("IV_VER=mihomo-openvpn\nIV_PROTO=6\n%sIV_CIPHERS=%s\n", lzo, cipher)
+	compression = normalizeCompressionUnchecked(compression)
+	if compression == CompressionCompLZO {
+		peerInfo += "IV_LZO=1\n"
+	} else if compression != CompressionNone {
+		peerInfo += "IV_LZO_STUB=1\nIV_COMP_STUB=1\nIV_COMP_STUBv2=1\n"
+	}
+	return peerInfo
+}
+
+func normalizeCompressionUnchecked(compression string) string {
+	normalized, err := NormalizeCompression(compression)
+	if err != nil {
+		return CompressionNone
+	}
+	return normalized
 }
 
 func appendOpenVPNString(out []byte, s string) []byte {

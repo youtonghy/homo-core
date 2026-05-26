@@ -10,13 +10,15 @@ import (
 const PushRequest = "PUSH_REQUEST"
 
 type PushReply struct {
-	Raw       string
-	Prefixes  []netip.Prefix
-	Routes    []netip.Prefix
-	DNS       []netip.Addr
-	PeerID    uint32
-	Redirect  bool
-	BlockIPv6 bool
+	Raw         string
+	Prefixes    []netip.Prefix
+	Routes      []netip.Prefix
+	DNS         []netip.Addr
+	PeerID      uint32
+	Redirect    bool
+	BlockIPv6   bool
+	TLSEKM      bool
+	Compression string
 }
 
 func ParsePushReply(message string) (*PushReply, error) {
@@ -84,6 +86,22 @@ func ParsePushReply(message string) (*PushReply, error) {
 			reply.Redirect = true
 		case "block-ipv6":
 			reply.BlockIPv6 = true
+		case "key-derivation":
+			if len(fields) >= 2 && fields[1] == "tls-ekm" {
+				reply.TLSEKM = true
+			}
+		case "protocol-flags":
+			for _, field := range fields[1:] {
+				if field == "tls-ekm" {
+					reply.TLSEKM = true
+				}
+			}
+		case "compress", "comp-lzo":
+			if compression, err := NormalizeCompression(strings.Join(fields, " ")); err == nil {
+				reply.Compression = compression
+			} else {
+				return nil, fmt.Errorf("parse pushed compression %q: %w", strings.Join(fields, " "), err)
+			}
 		}
 	}
 	if len(reply.Prefixes) == 0 {

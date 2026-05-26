@@ -11,6 +11,7 @@ type PacketMux struct {
 
 	control chan []byte
 	data    chan []byte
+	err     chan error
 	done    chan struct{}
 	once    sync.Once
 }
@@ -20,6 +21,7 @@ func NewPacketMux(io PacketIO) *PacketMux {
 		io:      io,
 		control: make(chan []byte, 64),
 		data:    make(chan []byte, 256),
+		err:     make(chan error, 1),
 		done:    make(chan struct{}),
 	}
 }
@@ -29,6 +31,10 @@ func (m *PacketMux) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		packet, err := m.io.ReadPacket(ctx)
 		if err != nil {
+			select {
+			case m.err <- err:
+			default:
+			}
 			return
 		}
 		if len(packet) == 0 {
@@ -53,6 +59,8 @@ func (m *PacketMux) ReadPacket(ctx context.Context) ([]byte, error) {
 	select {
 	case packet := <-m.control:
 		return packet, nil
+	case err := <-m.err:
+		return nil, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-m.done:
@@ -64,6 +72,8 @@ func (m *PacketMux) ReadDataPacket(ctx context.Context) ([]byte, error) {
 	select {
 	case packet := <-m.data:
 		return packet, nil
+	case err := <-m.err:
+		return nil, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-m.done:

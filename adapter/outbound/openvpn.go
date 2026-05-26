@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/metacubex/mihomo/common/contextutils"
@@ -41,42 +42,58 @@ type OpenVPN struct {
 
 type OpenVPNOption struct {
 	BasicOption
-	Name     string `proxy:"name"`
-	Server   string `proxy:"server"`
-	Port     int    `proxy:"port"`
-	Proto    string `proxy:"proto,omitempty"`
-	Dev      string `proxy:"dev,omitempty"`
-	Cipher   string `proxy:"cipher,omitempty"`
-	Auth     string `proxy:"auth,omitempty"`
-	CompLZO  string `proxy:"comp-lzo,omitempty"`
-	CA       string `proxy:"ca"`
-	Cert     string `proxy:"cert,omitempty"`
-	Key      string `proxy:"key,omitempty"`
-	TLSCrypt string `proxy:"tls-crypt,omitempty"`
-	Username string `proxy:"username,omitempty"`
-	Password string `proxy:"password,omitempty"`
-	MTU      int    `proxy:"mtu,omitempty"`
-	UDP      bool   `proxy:"udp,omitempty"`
+	Name         string `proxy:"name"`
+	Server       string `proxy:"server"`
+	Port         int    `proxy:"port"`
+	Proto        string `proxy:"proto,omitempty"`
+	Dev          string `proxy:"dev,omitempty"`
+	Cipher       string `proxy:"cipher,omitempty"`
+	Auth         string `proxy:"auth,omitempty"`
+	CompLZO      string `proxy:"comp-lzo,omitempty"`
+	CA           string `proxy:"ca"`
+	Cert         string `proxy:"cert,omitempty"`
+	Key          string `proxy:"key,omitempty"`
+	TLSCrypt     string `proxy:"tls-crypt,omitempty"`
+	TLSAuth      string `proxy:"tls-auth,omitempty"`
+	AuthTLS      string `proxy:"auth-tls,omitempty"`
+	KeyDirection string `proxy:"key-direction,omitempty"`
+	Username     string `proxy:"username,omitempty"`
+	Password     string `proxy:"password,omitempty"`
+	Compress     any    `proxy:"compress,omitempty"`
+	Compression  any    `proxy:"compression,omitempty"`
+	MTU          int    `proxy:"mtu,omitempty"`
+	UDP          bool   `proxy:"udp,omitempty"`
 
 	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
 	Dns              []string `proxy:"dns,omitempty"`
 }
 
 func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
+	tlsAuth := option.TLSAuth
+	if strings.TrimSpace(option.AuthTLS) != "" {
+		if strings.TrimSpace(tlsAuth) != "" && strings.TrimSpace(tlsAuth) != strings.TrimSpace(option.AuthTLS) {
+			return nil, errors.New("openvpn tls-auth and auth-tls must not both be set to different values")
+		}
+		tlsAuth = option.AuthTLS
+	}
+
 	cfg := &ovpn.ClientConfig{
-		RemoteHost: option.Server,
-		RemotePort: uint16(option.Port),
-		Proto:      option.Proto,
-		Dev:        option.Dev,
-		Cipher:     option.Cipher,
-		Auth:       option.Auth,
-		CompLZO:    option.CompLZO,
-		CA:         []byte(option.CA),
-		Cert:       []byte(option.Cert),
-		Key:        []byte(option.Key),
-		TLSCrypt:   []byte(option.TLSCrypt),
-		Username:   option.Username,
-		Password:   option.Password,
+		RemoteHost:   option.Server,
+		RemotePort:   uint16(option.Port),
+		Proto:        option.Proto,
+		Dev:          option.Dev,
+		Cipher:       option.Cipher,
+		Auth:         option.Auth,
+		CompLZO:      option.CompLZO,
+		CA:           []byte(option.CA),
+		Cert:         []byte(option.Cert),
+		Key:          []byte(option.Key),
+		TLSCrypt:     []byte(option.TLSCrypt),
+		TLSAuth:      []byte(tlsAuth),
+		KeyDirection: option.KeyDirection,
+		Username:     option.Username,
+		Password:     option.Password,
+		Compression:  openVPNCompressionOption(option.Compress, option.Compression),
 	}
 	if err := cfg.Prepare(); err != nil {
 		return nil, err
@@ -109,6 +126,27 @@ func NewOpenVPN(option OpenVPNOption) (*OpenVPN, error) {
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	outbound.runCtx, outbound.runCancel = context.WithCancel(context.Background())
 	return outbound, nil
+}
+
+func openVPNCompressionOption(values ...any) string {
+	for _, value := range values {
+		switch typed := value.(type) {
+		case nil:
+			continue
+		case bool:
+			if typed {
+				return ovpn.CompressionStub
+			}
+			return ovpn.CompressionNone
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return typed
+			}
+		default:
+			return fmt.Sprint(typed)
+		}
+	}
+	return ovpn.CompressionNone
 }
 
 func (o *OpenVPN) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {

@@ -44,10 +44,10 @@ type DataChannel struct {
 	sendImplicitIV [DataChannelIVSize]byte
 	recvImplicitIV [DataChannelIVSize]byte
 
-	keyID   uint8
-	peerID  uint32
-	header  []byte
-	compLZO string
+	keyID       uint8
+	peerID      uint32
+	header      []byte
+	compression string
 
 	mu           sync.Mutex
 	sendPacketID uint32
@@ -61,8 +61,16 @@ type DataChannel struct {
 }
 
 func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint32, compLZO string) (*DataChannel, error) {
+	return NewDataChannelWithCompression(keys, cipherName, authName, peerID, compressionFromCompLZO(compLZO))
+}
+
+func NewDataChannelWithCompression(keys *KeyMaterial, cipherName, authName string, peerID uint32, compression string) (*DataChannel, error) {
 	if keys == nil {
 		return nil, errors.New("nil openvpn key material")
+	}
+	compression, err := NormalizeCompression(compression)
+	if err != nil {
+		return nil, err
 	}
 	if isDataChannelAEAD(cipherName) {
 		send, err := newDataChannelAEAD(cipherName, keys.SendCipherKey)
@@ -77,11 +85,11 @@ func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint3
 			return nil, errors.New("openvpn implicit IV keys are too short")
 		}
 		d := &DataChannel{
-			sendAEAD: send,
-			recvAEAD: recv,
-			peerID:   peerID,
-			header:   dataHeader(peerID, 0),
-			compLZO:  compLZO,
+			sendAEAD:    send,
+			recvAEAD:    recv,
+			peerID:      peerID,
+			header:      dataHeader(peerID, 0),
+			compression: compression,
 		}
 		copy(d.sendImplicitIV[4:], keys.SendHMACKey[:DataChannelIVSize-4])
 		copy(d.recvImplicitIV[4:], keys.RecvHMACKey[:DataChannelIVSize-4])
@@ -112,7 +120,7 @@ func NewDataChannel(keys *KeyMaterial, cipherName, authName string, peerID uint3
 		authSize:    authSize,
 		peerID:      peerID,
 		header:      dataHeader(peerID, 0),
-		compLZO:     compLZO,
+		compression: compression,
 	}
 	d.sendMACPool.New = func() any {
 		return hmac.New(d.authHash, d.sendHMACKey)
@@ -177,20 +185,16 @@ func (d *DataChannel) Encrypt(packet []byte) ([]byte, error) {
 	if d == nil {
 		return nil, errors.New("nil openvpn data channel")
 	}
-
-	// Prepend comp-lzo header (0xfa = not compressed) to satisfy servers expecting the framing.
-	if d.compLZO == CompLzoYes {
-		lzoPacket := make([]byte, 1+len(packet))
-		lzoPacket[0] = lzoCompressNone
-		copy(lzoPacket[1:], packet)
-		packet = lzoPacket
+	framed, err := frameCompression(packet, d.compression)
+	if err != nil {
+		return nil, err
 	}
 
 	packetID := d.nextPacketID()
 	if d.sendAEAD != nil {
-		return d.encryptAEAD(packet, packetID)
+		return d.encryptAEAD(framed, packetID)
 	}
-	return d.encryptCBC(packet, packetID)
+	return d.encryptCBC(framed, packetID)
 }
 
 func (d *DataChannel) encryptAEAD(packet []byte, packetID uint32) ([]byte, error) {
@@ -254,16 +258,7 @@ func (d *DataChannel) Decrypt(packet []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if d.compLZO == CompLzoYes && len(plain) > 0 {
-		decompressed, err := lzo1xDecompressSafe(plain)
-		if err != nil {
-			return nil, err
-		}
-		if len(decompressed) > 0 {
-			return decompressed, nil
-		}
-	}
-	return plain, nil
+	return unframeCompression(plain, d.compression)
 }
 
 func (d *DataChannel) decryptAEAD(packet []byte, headerSize int) ([]byte, error) {

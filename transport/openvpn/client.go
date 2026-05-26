@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/tls"
 )
 
@@ -25,6 +26,7 @@ type Client struct {
 
 	control *ControlChannel
 	tlsConn *tls.Conn
+	tlsBuf  []byte
 	data    *DataChannel
 	push    *PushReply
 
@@ -38,13 +40,15 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	if io == nil {
 		return nil, errors.New("nil openvpn packet io")
 	}
-	var crypt *TLSCrypt
-	if len(config.TLSCryptKey) > 0 {
-		var err error
-		crypt, err = NewTLSCrypt(config.TLSCryptKey, true)
-		if err != nil {
-			return nil, err
-		}
+	var wrapper ControlPacketWrapper
+	var err error
+	if len(config.TLSAuthKey) > 0 {
+		wrapper, err = NewTLSAuth(config.TLSAuthKey, config.Auth, config.KeyDirection)
+	} else if len(config.TLSCryptKey) > 0 {
+		wrapper, err = NewTLSCrypt(config.TLSCryptKey, true)
+	}
+	if err != nil {
+		return nil, err
 	}
 	local, err := NewSessionID()
 	if err != nil {
@@ -56,7 +60,7 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	return &Client{
 		config:  config,
 		mux:     mux,
-		control: NewControlChannel(mux, crypt, local),
+		control: NewControlChannel(mux, wrapper, local),
 		cancel:  cancel,
 	}, nil
 }
@@ -90,9 +94,17 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, fmt.Errorf("openvpn tls handshake: %w", err)
 	}
 
+	compression := c.config.CompressionMode()
+	controlKeyMode := "tls-crypt"
+	if len(c.config.TLSAuthKey) > 0 {
+		controlKeyMode = "tls-auth"
+	}
+	clientOptions := InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.KeyDirection, controlKeyMode, compression)
+	clientPeerInfo := InstallScriptPeerInfo(c.config.Proto, c.config.Cipher, compression)
+	log.Debugln("[OpenVPN] key-method options=%q peer-info=%q", clientOptions, clientPeerInfo)
 	clientRecord, err := NewClientKeyMethod2Record(
-		InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO),
-		InstallScriptPeerInfo(c.config.Cipher, c.config.CompLZO),
+		clientOptions,
+		clientPeerInfo,
 		strings.TrimSpace(c.config.Username),
 		c.config.Password,
 	)
@@ -111,13 +123,6 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 
-	sources := clientRecord.Sources
-	sources.Server = serverRecord.Sources.Server
-	keys, err := DeriveClientKeyMaterial(sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), c.config.DataCipherKeyLength())
-	if err != nil {
-		return nil, fmt.Errorf("derive data channel keys: %w", err)
-	}
-
 	if _, err := c.tlsConn.Write([]byte(PushRequest + "\x00")); err != nil {
 		return nil, fmt.Errorf("write push request: %w", err)
 	}
@@ -125,8 +130,17 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Debugln("[OpenVPN] push reply: peer-id=%d tls-ekm=%t raw=%q", push.PeerID, push.TLSEKM, push.Raw)
+	if push.Compression != "" {
+		compression = push.Compression
+	}
+	log.Debugln("[OpenVPN] negotiated compression=%q", compression)
+	keys, err := c.deriveDataChannelKeys(clientRecord, serverRecord, push)
+	if err != nil {
+		return nil, err
+	}
 	c.push = push
-	c.data, err = NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID, c.config.CompLZO)
+	c.data, err = NewDataChannelWithCompression(keys, c.config.Cipher, c.config.Auth, push.PeerID, compression)
 	if err != nil {
 		return nil, err
 	}
@@ -137,10 +151,12 @@ func (c *Client) WriteIPPacket(ctx context.Context, packet []byte) error {
 	if c.data == nil {
 		return errors.New("openvpn data channel is not ready")
 	}
+	log.Debugln("[OpenVPN] send IP packet len=%d", len(packet))
 	encrypted, err := c.data.Encrypt(packet)
 	if err != nil {
 		return err
 	}
+	log.Debugln("[OpenVPN] send data packet len=%d", len(encrypted))
 	return c.mux.WritePacket(ctx, encrypted)
 }
 
@@ -155,8 +171,15 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 		}
 		plain, err := c.data.Decrypt(packet)
 		if err != nil {
+			if len(packet) > 0 {
+				opcode, keyID := parseOpcodeKeyID(packet[0])
+				log.Debugln("[OpenVPN] drop data packet opcode=%s key-id=%d len=%d: %v", opcode, keyID, len(packet), err)
+			} else {
+				log.Debugln("[OpenVPN] drop empty data packet: %v", err)
+			}
 			continue
 		}
+		log.Debugln("[OpenVPN] recv IP packet len=%d", len(plain))
 		return plain, nil
 	}
 }
@@ -172,6 +195,32 @@ func (c *Client) Close() error {
 		return c.mux.Close()
 	}
 	return nil
+}
+
+func (c *Client) deriveDataChannelKeys(clientRecord, serverRecord *KeyMethod2Record, push *PushReply) (*KeyMaterial, error) {
+	cipherKeyLen := c.config.DataCipherKeyLength()
+	if push != nil && push.TLSEKM {
+		log.Debugln("[OpenVPN] deriving data channel keys via TLS exporter")
+		state := c.tlsConn.ConnectionState()
+		exported, err := state.ExportKeyingMaterial(exportKeyDataLabel, nil, exportedKeyMaterialSize)
+		if err != nil {
+			return nil, fmt.Errorf("export tls keying material: %w", err)
+		}
+		keys, err := DeriveClientKeyMaterialExported(exported, cipherKeyLen)
+		if err != nil {
+			return nil, fmt.Errorf("derive exported data channel keys: %w", err)
+		}
+		return keys, nil
+	}
+
+	log.Debugln("[OpenVPN] deriving data channel keys via control handshake material")
+	sources := clientRecord.Sources
+	sources.Server = serverRecord.Sources.Server
+	keys, err := DeriveClientKeyMaterial(sources, c.control.LocalSessionID(), c.control.RemoteSessionID(), cipherKeyLen)
+	if err != nil {
+		return nil, fmt.Errorf("derive data channel keys: %w", err)
+	}
+	return keys, nil
 }
 
 func (c *Client) waitServerReset(ctx context.Context) error {
@@ -215,8 +264,11 @@ func (c *Client) readServerKeyMethod(ctx context.Context) (*KeyMethod2Record, er
 			return nil, fmt.Errorf("read key method 2 server record: %w", err)
 		}
 		buf = append(buf, tmp[:n]...)
-		record, err := ParseServerKeyMethod2Record(buf)
+		record, offset, err := parseServerKeyMethod2Record(buf)
 		if err == nil {
+			if offset < len(buf) {
+				c.tlsBuf = append(c.tlsBuf, buf[offset:]...)
+			}
 			return record, nil
 		}
 		if !strings.Contains(err.Error(), "truncated") && !errors.Is(err, ioStringEOF) {
@@ -226,9 +278,28 @@ func (c *Client) readServerKeyMethod(ctx context.Context) (*KeyMethod2Record, er
 }
 
 func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
-	var buf []byte
+	buf := c.tlsBuf
+	c.tlsBuf = nil
 	tmp := make([]byte, 4096)
 	for {
+		for {
+			idx := bytes.IndexByte(buf, 0)
+			if idx < 0 {
+				break
+			}
+			msg := string(buf[:idx])
+			buf = buf[idx+1:]
+			if strings.TrimSpace(msg) == "" {
+				continue
+			}
+			reply, err := handlePushControlMessage(msg)
+			if err != nil {
+				return nil, err
+			}
+			if reply != nil {
+				return reply, nil
+			}
+		}
 		if deadline, ok := ctx.Deadline(); ok {
 			_ = c.tlsConn.SetReadDeadline(deadline)
 		}
@@ -240,17 +311,38 @@ func (c *Client) readPushReply(ctx context.Context) (*PushReply, error) {
 			return nil, fmt.Errorf("read push reply: %w", err)
 		}
 		buf = append(buf, tmp[:n]...)
-		if bytes.Contains(buf, []byte("\x00")) || strings.Contains(string(buf), "PUSH_REPLY") {
-			msg := string(buf)
-			if idx := strings.IndexByte(msg, 0); idx >= 0 {
-				msg = msg[:idx]
-			}
-			if reply, err := ParsePushReply(msg); err == nil {
-				return reply, nil
-			}
-		}
 	}
 	return nil, ctx.Err()
+}
+
+func handlePushControlMessage(msg string) (*PushReply, error) {
+	msg = strings.TrimRight(msg, "\x00")
+	switch {
+	case strings.HasPrefix(msg, "PUSH_REPLY"):
+		reply, err := ParsePushReply(msg)
+		if err != nil {
+			return nil, fmt.Errorf("parse push reply %q: %w", msg, err)
+		}
+		return reply, nil
+	case strings.HasPrefix(msg, "AUTH_FAILED"):
+		reason := strings.TrimPrefix(msg, "AUTH_FAILED")
+		reason = strings.TrimPrefix(reason, ",")
+		if reason == "" {
+			return nil, fmt.Errorf("openvpn authentication failed: %q", msg)
+		}
+		return nil, fmt.Errorf("openvpn authentication failed: %s", reason)
+	case strings.HasPrefix(msg, "AUTH_PENDING"),
+		strings.HasPrefix(msg, "INFO_PRE"),
+		strings.HasPrefix(msg, "INFO"),
+		strings.HasPrefix(msg, "CR_RESPONSE"):
+		return nil, nil
+	case strings.HasPrefix(msg, "RESTART"),
+		strings.HasPrefix(msg, "HALT"),
+		strings.HasPrefix(msg, "EXIT"):
+		return nil, fmt.Errorf("openvpn server requested %s", msg)
+	default:
+		return nil, fmt.Errorf("unexpected openvpn control message while waiting for push reply: %q", msg)
+	}
 }
 
 func (c *Client) tlsConfig() (*tls.Config, error) {

@@ -72,8 +72,33 @@ func TestClientConfigDefaults(t *testing.T) {
 	if err := cfg.Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Proto != ProtoUDP || cfg.Dev != "tun" || cfg.Cipher != CipherAES128GCM || cfg.Auth != AuthSHA256 {
+	if cfg.Proto != ProtoUDP || cfg.Dev != "tun" || cfg.Cipher != CipherAES128GCM || cfg.Auth != AuthSHA1 {
 		t.Fatalf("unexpected defaults: proto=%s dev=%s cipher=%s auth=%s", cfg.Proto, cfg.Dev, cfg.Cipher, cfg.Auth)
+	}
+}
+
+func TestClientConfigCompression(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.Compression = "compress"
+
+	if err := cfg.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Compression != CompressionStub {
+		t.Fatalf("unexpected compression: %q", cfg.Compression)
+	}
+}
+
+func TestClientConfigRejectsUnsupportedCompression(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.Compression = "lz4"
+
+	err := cfg.Prepare()
+	if err == nil {
+		t.Fatal("expected unsupported compression error")
+	}
+	if !strings.Contains(err.Error(), "compression") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -89,14 +114,15 @@ func TestClientConfigRejectsUnsupportedProto(t *testing.T) {
 	}
 }
 
-func TestClientConfigAllowsMissingTLSCrypt(t *testing.T) {
+func TestClientConfigRequiresControlChannelStaticKey(t *testing.T) {
 	cfg := yamlStyleConfig()
 	cfg.TLSCrypt = nil
-	if err := cfg.Prepare(); err != nil {
-		t.Fatal(err)
+	err := cfg.Prepare()
+	if err == nil {
+		t.Fatal("expected missing control-channel static key error")
 	}
-	if len(cfg.TLSCryptKey) != 0 {
-		t.Fatalf("unexpected tls-crypt key length: %d", len(cfg.TLSCryptKey))
+	if !strings.Contains(err.Error(), "tls-crypt") || !strings.Contains(err.Error(), "tls-auth") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -145,6 +171,50 @@ func TestClientConfigAESCBCSHA1(t *testing.T) {
 	}
 	if cfg.DataCipherKeyLength() != 16 {
 		t.Fatalf("unexpected data key length helper: %d", cfg.DataCipherKeyLength())
+	}
+}
+
+func TestClientConfigTLSAuth(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.TLSCrypt = nil
+	cfg.TLSAuth = []byte(testTLSCryptBlock())
+	cfg.KeyDirection = "1"
+	cfg.Auth = AuthSHA1
+
+	if err := cfg.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TLSAuthKey) != 256 {
+		t.Fatalf("unexpected tls-auth key length: %d", len(cfg.TLSAuthKey))
+	}
+	if cfg.Auth != AuthSHA1 || cfg.KeyDirection != "1" {
+		t.Fatalf("unexpected tls-auth settings: auth=%s key-direction=%s", cfg.Auth, cfg.KeyDirection)
+	}
+}
+
+func TestClientConfigRejectsBothTLSCryptAndTLSAuth(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.TLSAuth = []byte(testTLSCryptBlock())
+	err := cfg.Prepare()
+	if err == nil {
+		t.Fatal("expected mutually exclusive tls key error")
+	}
+	if !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClientConfigRejectsBadKeyDirection(t *testing.T) {
+	cfg := yamlStyleConfig()
+	cfg.TLSCrypt = nil
+	cfg.TLSAuth = []byte(testTLSCryptBlock())
+	cfg.KeyDirection = "2"
+	err := cfg.Prepare()
+	if err == nil {
+		t.Fatal("expected bad key-direction error")
+	}
+	if !strings.Contains(err.Error(), "key-direction") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

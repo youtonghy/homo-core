@@ -66,25 +66,43 @@ func (d dummyAddr) String() string  { return string(d) }
 
 func newTestChannels(t *testing.T) (*ControlChannel, *ControlChannel) {
 	t.Helper()
+	clientWrapper, err := NewTLSCrypt(testStaticKey(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverWrapper, err := NewTLSCrypt(testStaticKey(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newTestChannelsWithWrappers(t, clientWrapper, serverWrapper)
+}
+
+func newTestChannelsWithWrappers(t *testing.T, clientWrapper, serverWrapper ControlPacketWrapper) (*ControlChannel, *ControlChannel) {
+	t.Helper()
 	clientIO, serverIO := newMemoryPacketPair()
-	clientCrypt, err := NewTLSCrypt(testStaticKey(), true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverCrypt, err := NewTLSCrypt(testStaticKey(), false)
-	if err != nil {
-		t.Fatal(err)
-	}
 	var clientID SessionID
 	copy(clientID[:], []byte("client01"))
 	var serverID SessionID
 	copy(serverID[:], []byte("server01"))
 
-	client := NewControlChannel(clientIO, clientCrypt, clientID)
-	server := NewControlChannel(serverIO, serverCrypt, serverID)
+	client := NewControlChannel(clientIO, clientWrapper, clientID)
+	server := NewControlChannel(serverIO, serverWrapper, serverID)
 	client.clock = func() time.Time { return time.Unix(1714567890, 0) }
 	server.clock = func() time.Time { return time.Unix(1714567891, 0) }
 	return client, server
+}
+
+func newTLSAuthTestChannels(t *testing.T) (*ControlChannel, *ControlChannel) {
+	t.Helper()
+	clientWrapper, err := NewTLSAuth(testStaticKey(), AuthSHA256, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverWrapper, err := NewTLSAuth(testStaticKey(), AuthSHA256, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newTestChannelsWithWrappers(t, clientWrapper, serverWrapper)
 }
 
 func TestControlChannelResetAndAck(t *testing.T) {
@@ -102,6 +120,40 @@ func TestControlChannelResetAndAck(t *testing.T) {
 	}
 	if packetID := client.sendPacketID; packetID != 1 {
 		t.Fatalf("unexpected first tls-crypt packet id: %d", packetID)
+	}
+	if server.RemoteSessionID() != client.LocalSessionID() {
+		t.Fatalf("server did not learn client session id")
+	}
+
+	if err := server.SendAck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = client.Read(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline after consuming pure ack, got %v", err)
+	}
+	if client.PendingMessages() != 0 {
+		t.Fatalf("expected client reset to be acked, pending=%d", client.PendingMessages())
+	}
+}
+
+func TestControlChannelResetAndAckTLSAuth(t *testing.T) {
+	client, server := newTLSAuthTestChannels(t)
+
+	if err := client.SendReset(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := server.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Opcode != PControlHardResetClientV2 || packet.MessageID != 0 {
+		t.Fatalf("unexpected reset packet: %s/%d", packet.Opcode, packet.MessageID)
+	}
+	if packetID := client.sendPacketID; packetID != 1 {
+		t.Fatalf("unexpected first tls-auth packet id: %d", packetID)
 	}
 	if server.RemoteSessionID() != client.LocalSessionID() {
 		t.Fatalf("server did not learn client session id")
@@ -264,6 +316,42 @@ func TestClientWaitServerResetRetransmitsUDP(t *testing.T) {
 	}
 	if clientControl.PendingMessages() != 0 {
 		t.Fatalf("expected client reset to be acked, pending=%d", clientControl.PendingMessages())
+	}
+}
+
+func TestControlConnCarriesTLSBytesTLSAuth(t *testing.T) {
+	client, server := newTLSAuthTestChannels(t)
+	client.SetRemoteSessionID(server.LocalSessionID())
+	server.SetRemoteSessionID(client.LocalSessionID())
+
+	clientConn := NewControlConn(client)
+	serverConn := NewControlConn(server)
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write([]byte("client tls record"))
+		errCh <- err
+	}()
+
+	buf := make([]byte, 64)
+	n, err := serverConn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "client tls record" {
+		t.Fatalf("unexpected payload: %q", got)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = client.Read(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline after consuming pure ack, got %v", err)
+	}
+	if client.PendingMessages() != 0 {
+		t.Fatalf("expected client message to be acked, pending=%d", client.PendingMessages())
 	}
 }
 

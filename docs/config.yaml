@@ -1173,7 +1173,7 @@ proxies: # socks5
     proto: udp # udp/tcp，默认 udp
     # dev: tun # 目前仅支持 tun，默认 tun
     # cipher: AES-128-GCM # 支持 AES-128-GCM / AES-192-GCM / AES-256-GCM / AES-128-CBC / AES-192-CBC / AES-256-CBC / CHACHA20-POLY1305，默认 AES-128-GCM；AES-CBC 会按 AES-128-CBC 处理
-    # auth: SHA256 # 支持 MD5 / SHA1 / SHA256 / SHA384 / SHA512，默认 SHA256；AEAD cipher 会忽略 auth
+    # auth: SHA1 # 支持 MD5 / SHA1 / SHA256 / SHA384 / SHA512，默认 SHA1；AEAD cipher 会忽略 auth
     # comp-lzo: "no" # 可选值："yes", "no", "adaptive"
     # username / password: auth-user-pass 模式（与下方 cert+key 二选一，不能都不填）
     # username: "user"
@@ -1193,12 +1193,21 @@ proxies: # socks5
       -----BEGIN PRIVATE KEY-----
       MIIE...example
       -----END PRIVATE KEY-----
-    # 从 .ovpn 中复制 <tls-crypt></tls-crypt> 内的内容，不需要保留 <tls-crypt> 标签；没有 tls-crypt 的配置可省略
-    # tls-crypt: |
+    # 从 .ovpn 中复制 <tls-crypt></tls-crypt> 内的内容，不需要保留 <tls-crypt> 标签
+    # tls-crypt 与 tls-auth/auth-tls 二选一，不能同时设置
+    tls-crypt: |
+      -----BEGIN OpenVPN Static key V1-----
+      00000000000000000000000000000000
+      ...
+      -----END OpenVPN Static key V1-----
+    # 或者使用 <tls-auth></tls-auth> / auth-tls 格式；key-direction 支持 0 / 1
+    # tls-auth: |
     #   -----BEGIN OpenVPN Static key V1-----
     #   00000000000000000000000000000000
     #   ...
     #   -----END OpenVPN Static key V1-----
+    # key-direction: 1
+    # compress: true # 对应 .ovpn 的 "compress"（stub framing）；也支持 "stub-v2" / "comp-lzo no"
     # mtu: 1500
     udp: true
     # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
